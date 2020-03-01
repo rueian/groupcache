@@ -75,6 +75,8 @@ func (g *Group) Get(ctx context.Context, key string) (data Data, err error) {
 			return d, nil
 		}
 		defer func() {
+			// if the local cache is not acceptable and final data is not loaded
+			// then reset the local cache state by calling Questionable()
 			if data == nil {
 				d.Questionable()
 			}
@@ -101,7 +103,7 @@ func (g *Group) Get(ctx context.Context, key string) (data Data, err error) {
 						}
 						continue
 					} else if rand.Intn(10) == 0 {
-						g.populateCache(replica, data, g.hot)
+						g.populateCache(key, data, g.hot)
 					}
 
 					if i == 0 {
@@ -123,20 +125,21 @@ func (g *Group) Get(ctx context.Context, key string) (data Data, err error) {
 						}
 					}
 				}
+				break
 			}
-			if data == nil {
-				data, err = g.loader.Load(ctx, key)
-				if err != nil {
-					atomic.AddInt64(&g.Stats.LocalLoads, 1)
-				} else {
-					atomic.AddInt64(&g.Stats.LocalLoadErrs, 1)
-				}
+		}
+		if data == nil {
+			data, err = g.loader.Load(ctx, key)
+			if err != nil {
+				atomic.AddInt64(&g.Stats.LocalLoads, 1)
+			} else {
+				atomic.AddInt64(&g.Stats.LocalLoadErrs, 1)
 			}
-			if data != nil {
-				g.populateCache(replica, data, g.main)
-				err = nil
-				return
-			}
+		}
+		if data != nil {
+			g.populateCache(key, data, g.main)
+			err = nil
+			return
 		}
 		return
 	})
