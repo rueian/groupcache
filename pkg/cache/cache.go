@@ -2,55 +2,23 @@ package cache
 
 import (
 	"context"
+	"github.com/rueian/groupcache/pkg/data"
+	"github.com/rueian/groupcache/pkg/flight"
+	"github.com/rueian/groupcache/pkg/peer"
 	"math/rand"
 	"strconv"
 	"sync/atomic"
 )
 
-type PeerPicker interface {
-	// should return peers in sequence of trying
-	Pick(key string, max int) []Peer
-}
-
-type Peer interface {
-	Lookup(ctx context.Context, key string) (Data, error)
-	LookupOrLoad(ctx context.Context, key string) (Data, error)
-	Push(ctx context.Context, key string, data Data) error
-	Self() bool
-	WarmingUp() bool
-}
-
-type DataLoader interface {
-	Load(ctx context.Context, key string) (Data, error)
-}
-
-type FlightGroup interface {
-	// Done is called when Do is done.
-	Do(key string, fn func() (Data, error)) (Data, error)
-}
-
-type Store interface {
-	Get(key string) Data
-	Add(key string, data Data)
-	RemoveOne()
-	Bytes() int64
-}
-
-type Data interface {
-	Val() []byte
-	Acceptable() bool
-	Questionable()
-}
-
 type Group struct {
 	name     string
 	maxBytes int64
-	flights  FlightGroup
-	peers    PeerPicker
-	loader   DataLoader
+	flights  *flight.Group
+	peers    peer.Picker
+	loader   data.Loader
 
-	main Store
-	hot  Store
+	main data.Store
+	hot  data.Store
 
 	delegate int
 	replicas int
@@ -61,7 +29,7 @@ type Group struct {
 	Stats Stats
 }
 
-func (g *Group) Get(ctx context.Context, key string) (data Data, err error) {
+func (g *Group) Get(ctx context.Context, key string) (value data.Value, err error) {
 	atomic.AddInt64(&g.Stats.Gets, 1)
 
 	replicas := make([]string, g.replicas)
@@ -77,15 +45,15 @@ func (g *Group) Get(ctx context.Context, key string) (data Data, err error) {
 		defer func() {
 			// if the local cache is not acceptable and final data is not loaded
 			// then reset the local cache state by calling Questionable()
-			if data == nil {
+			if value == nil {
 				d.Questionable()
 			}
 		}()
 	}
 
-	data, err = g.flights.Do(key, func() (data Data, err error) {
+	value, err = g.flights.Do(key, func() (value data.Value, err error) {
 		// try again in local cache, it could be just filled by another flight
-		if data = g.LocalLookup(key); data != nil {
+		if value = g.LocalLookup(key); value != nil {
 			atomic.AddInt64(&g.Stats.CacheHits, 1)
 			return
 		}
@@ -94,8 +62,8 @@ func (g *Group) Get(ctx context.Context, key string) (data Data, err error) {
 			peers := g.peers.Pick(replica, g.delegate)
 			if len(peers) > 0 {
 				if !peers[0].Self() {
-					// load from remote peer, using replica to prevent peer failure
-					if data, err = peers[0].LookupOrLoad(ctx, key); err != nil {
+					// load from remote mockpeer, using replica to prevent mockpeer failure
+					if value, err = peers[0].LookupOrLoad(ctx, key); err != nil {
 						if i == 0 {
 							atomic.AddInt64(&g.Stats.PeerErrors, 1)
 						} else {
@@ -103,7 +71,7 @@ func (g *Group) Get(ctx context.Context, key string) (data Data, err error) {
 						}
 						continue
 					} else if rand.Intn(10) == 0 {
-						g.populateCache(key, data, g.hot)
+						g.populateCache(key, value, g.hot)
 					}
 
 					if i == 0 {
@@ -117,7 +85,7 @@ func (g *Group) Get(ctx context.Context, key string) (data Data, err error) {
 				// try neighbors during warming up
 				if peers[0].WarmingUp() {
 					for _, peer := range peers[1:] {
-						if data, err = peer.Lookup(ctx, key); data != nil {
+						if value, err = peer.Lookup(ctx, key); value != nil {
 							atomic.AddInt64(&g.Stats.NeighborWarmUpLoads, 1)
 							break
 						} else {
@@ -128,35 +96,35 @@ func (g *Group) Get(ctx context.Context, key string) (data Data, err error) {
 				break
 			}
 		}
-		if data == nil {
-			data, err = g.loader.Load(ctx, key)
+		if value == nil {
+			value, err = g.loader.Load(ctx, key)
 			if err != nil {
 				atomic.AddInt64(&g.Stats.LocalLoads, 1)
 			} else {
 				atomic.AddInt64(&g.Stats.LocalLoadErrs, 1)
 			}
 		}
-		if data != nil {
-			g.populateCache(key, data, g.main)
+		if value != nil {
+			g.populateCache(key, value, g.main)
 			err = nil
 			return
 		}
 		return
 	})
 	atomic.AddInt64(&g.Stats.LoadsDeduped, 1)
-	if data != nil {
+	if value != nil {
 		// successfully load data, push to other replicas
 		for _, replica := range replicas {
 			peers := g.peers.Pick(replica, 1)
 			if len(peers) > 0 && !peers[0].Self() {
-				_ = peers[0].Push(ctx, key, data)
+				_ = peers[0].Push(ctx, key, value)
 			}
 		}
 	}
 	return
 }
 
-func (g *Group) populateCache(key string, data Data, store Store) {
+func (g *Group) populateCache(key string, data data.Value, store data.Store) {
 	if g.maxBytes <= 0 {
 		return
 	}
@@ -181,7 +149,7 @@ func (g *Group) populateCache(key string, data Data, store Store) {
 	}
 }
 
-func (g *Group) LocalLookup(key string) Data {
+func (g *Group) LocalLookup(key string) data.Value {
 	if v := g.hot.Get(key); v != nil {
 		return v
 	}
@@ -193,7 +161,7 @@ type Stats struct {
 	CacheHits      int64 // either cache was good
 	PeerLoads      int64 // either remote load or remote cache hit (not an error)
 	PeerErrors     int64
-	LoadsDeduped   int64 // after singleflight
+	LoadsDeduped   int64 // after flight
 	LocalLoads     int64 // total good local loads
 	LocalLoadErrs  int64 // total bad local loads
 	ServerRequests int64 // gets that came over the network from peers
